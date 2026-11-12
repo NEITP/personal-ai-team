@@ -1,0 +1,35 @@
+﻿version: 1
+
+routing:
+  simple_questions:
+    primary: codex
+    secondary: none
+
+  technical_research:
+    primary: antigravity
+    reviewer: codex
+
+  coding:
+    primary: codex
+    secondary: antigravity
+    require_review: true
+
+  architecture:
+    primary: codex
+    secondary: antigravity
+    require_review: true
+
+  debugging:
+    primary: codex
+    secondary: antigravity
+    require_review: true
+
+  code_review:
+    primary: codex
+    secondary: none
+
+execution:
+  mode: sequential
+  max_agents_per_task: 2
+  max_retries: 1
+  reuse_previous_results: true

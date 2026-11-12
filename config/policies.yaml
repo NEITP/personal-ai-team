@@ -1,0 +1,32 @@
+﻿version: 1
+
+security:
+  protect_secrets: true
+  protect_env_files: true
+  restrict_workspace: true
+
+approval:
+  delete_files: required
+  database_migration: required
+  production_deployment: required
+  git_push: required
+  git_merge: required
+  overwrite_existing_files: required
+
+git:
+  auto_commit: false
+  auto_push: false
+  auto_merge: false
+  require_diff_review: true
+
+cost:
+  prefer_existing_context: true
+  avoid_duplicate_requests: true
+  max_agents_per_task: 2
+  prefer_free_tier: true
+  use_local_models_when_available: true
+
+execution:
+  parallel_execution: false
+  preserve_logs: true
+  timeout_seconds: 900

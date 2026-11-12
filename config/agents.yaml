@@ -1,0 +1,26 @@
+﻿agents:
+  orchestrator:
+    name: Codex
+    command: codex
+    role: primary
+    enabled: true
+
+  researcher:
+    name: Antigravity
+    command: agy
+    role: research
+    enabled: true
+
+  local:
+    name: Ollama
+    command: ollama
+    role: local
+    enabled: false
+
+settings:
+  max_agents_per_task: 2
+  max_retries: 1
+  parallel_execution: false
+  require_human_approval: true
+  auto_commit: false
+  auto_merge: false
