@@ -23,6 +23,7 @@ class TestTaskManager(unittest.TestCase):
         mock_create.assert_called_once_with(
             original_task="Test task",
             agents=["codex", "antigravity"],
+            execution_mode="sequential",
         )
         self.assertEqual(result, expected)
 

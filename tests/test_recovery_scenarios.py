@@ -240,7 +240,7 @@ class TestRecoveryScenarios(unittest.TestCase):
             final_report="results/old-report.md",
         )
 
-    # TC03: Stop the workflow when an agent fails.
+    # TC03: Stop after the configured retry limit is exhausted.
     def test_agent_failure_stops_workflow_and_skips_synthesis(self):
         workflow = make_workflow("results/old-report.md")
         latest = make_workflow(None)
@@ -254,12 +254,12 @@ class TestRecoveryScenarios(unittest.TestCase):
             workflow,
             latest,
             plan,
-            [False],
+            [False, False],
         )
 
         mocks["fail_agent"].assert_called_once()
 
-        mocks["run_agent"].assert_called_once()
+        self.assertEqual(mocks["run_agent"].call_count, 2)
 
         mocks["synthesizer"].assert_not_called()
 
@@ -312,6 +312,85 @@ class TestRecoveryScenarios(unittest.TestCase):
             self.workflow_id,
             "PARTIAL",
             error="Agents completed, but synthesis failed.",
+        )
+
+    def test_parallel_recovery_reuses_finished_agent_and_retries_only_pending(self):
+        codex = make_result("codex", "TASK-OLD-001")
+        new_antigravity = make_result("antigravity", "TASK-NEW-002")
+
+        workflow = make_workflow(None)
+        workflow["execution_mode"] = "parallel"
+        latest = make_workflow(None)
+        latest["execution_mode"] = "parallel"
+        plan = make_plan(
+            completed_results=[codex],
+            pending_agents=["antigravity"],
+        )
+
+        stack, mocks = self.setup_mocks(workflow, latest, plan)
+        parallel_call = stack.enter_context(
+            patch(
+                "orchestrator.main.run_parallel_agents",
+                return_value=[new_antigravity],
+            )
+        )
+
+        try:
+            with redirect_stdout(StringIO()):
+                from orchestrator.main import resume_workflow
+                result = resume_workflow(self.workflow_id)
+        finally:
+            stack.close()
+
+        self.assertEqual(result, 0)
+        parallel_call.assert_called_once_with(
+            "Test recovery workflow.",
+            ["antigravity"],
+            self.workflow_id,
+        )
+        mocks["run_agent"].assert_not_called()
+        mocks["synthesizer"].assert_called_once()
+        synthesized_results = mocks["synthesizer"].call_args.args[1]
+        self.assertEqual(
+            [item["task_id"] for item in synthesized_results],
+            ["TASK-OLD-001", "TASK-NEW-002"],
+        )
+
+    def test_parallel_recovery_failure_keeps_success_and_skips_synthesis(self):
+        codex = make_result("codex", "TASK-OLD-001")
+        workflow = make_workflow(None)
+        workflow["execution_mode"] = "parallel"
+        latest = make_workflow(None)
+        latest["execution_mode"] = "parallel"
+        plan = make_plan(
+            completed_results=[codex],
+            pending_agents=["antigravity"],
+        )
+
+        stack, mocks = self.setup_mocks(workflow, latest, plan)
+        parallel_call = stack.enter_context(
+            patch(
+                "orchestrator.main.run_parallel_agents",
+                return_value=[False],
+            )
+        )
+        try:
+            with redirect_stdout(StringIO()):
+                from orchestrator.main import resume_workflow
+                result = resume_workflow(self.workflow_id)
+        finally:
+            stack.close()
+
+        self.assertEqual(result, 0)
+        parallel_call.assert_called_once_with(
+            "Test recovery workflow.",
+            ["antigravity"],
+            self.workflow_id,
+        )
+        mocks["synthesizer"].assert_not_called()
+        mocks["finish_task"].assert_called_once_with(
+            workflow_id=self.workflow_id,
+            final_report=None,
         )
 
 

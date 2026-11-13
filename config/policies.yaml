@@ -4,6 +4,7 @@ security:
   protect_secrets: true
   protect_env_files: true
   restrict_workspace: true
+  scan_secret_content: true
 
 approval:
   delete_files: required
@@ -22,11 +23,32 @@ git:
 cost:
   prefer_existing_context: true
   avoid_duplicate_requests: true
-  max_agents_per_task: 2
   prefer_free_tier: true
   use_local_models_when_available: true
 
 execution:
-  parallel_execution: false
   preserve_logs: true
   timeout_seconds: 900
+
+logging:
+  include_prompt: false
+  include_raw_output: false
+  include_diagnostics: false
+  include_structured_result: false
+
+context:
+  show_loaded_files: true
+  max_file_size_bytes: 60000
+  max_total_characters: 100000
+  blocked_file_patterns:
+    - ".env"
+    - ".env.*"
+    - "*credential*"
+    - "*secret*"
+    - "id_rsa*"
+    - "id_ed25519*"
+    - "*.pem"
+    - "*.key"
+    - "*.p12"
+    - "*.pfx"
+    - "*.ppk"

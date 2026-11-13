@@ -14,13 +14,11 @@
   local:
     name: Ollama
     command: ollama
+    model: llama3.2
     role: local
-    enabled: false
+    enabled: true
 
 settings:
-  max_agents_per_task: 2
-  max_retries: 1
-  parallel_execution: false
   require_human_approval: true
   auto_commit: false
   auto_merge: false

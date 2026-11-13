@@ -1,15 +1,26 @@
 
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
-import shutil
 import time
 import re
 import json
+import sys
+import fnmatch
+import threading
 
-from validator import validate_task, validate_result
-import task_manager
-import recovery_manager
+try:
+    from .validator import validate_task, validate_result
+    from . import task_manager, recovery_manager, agent_adapters, retention
+    from .configuration import load_configuration, agents_for_route, route_execution
+except ImportError:
+    from validator import validate_task, validate_result
+    import task_manager
+    import recovery_manager
+    import agent_adapters
+    import retention
+    from configuration import load_configuration, agents_for_route, route_execution
 
 # ==========================================
 # PROJECT CONFIGURATION
@@ -22,15 +33,23 @@ LOG_FILE = LOG_DIR / "agent_runs.log"
 
 RESULT_DIR = PROJECT_ROOT / "results"
 
-TIMEOUT_SECONDS = 900
+CONFIGURATION = load_configuration()
+TIMEOUT_SECONDS = CONFIGURATION["timeout_seconds"]
 
-MAX_FILE_SIZE = 60_000
-MAX_TOTAL_CONTEXT = 100_000
+MAX_FILE_SIZE = CONFIGURATION["context"]["max_file_size_bytes"]
+MAX_TOTAL_CONTEXT = CONFIGURATION["context"]["max_total_characters"]
 
 AGENTS = {
     "1": ["codex"],
     "2": ["antigravity"],
     "3": ["codex", "antigravity"],
+    "6": ["ollama"],
+}
+prune_workflows = retention.prune_completed_workflows
+AGENTS = {
+    choice: selected
+    for choice, selected in AGENTS.items()
+    if all(agent in CONFIGURATION["agents"] for agent in selected)
 }
 
 SUPPORTED_EXTENSIONS = {
@@ -39,13 +58,16 @@ SUPPORTED_EXTENSIONS = {
     ".html", ".css", ".sql", ".xml", ".toml",
 }
 
-BLOCKED_NAMES = {
-    ".env",
-    "credentials.json",
-    "secrets.json",
-    "id_rsa",
-    "id_ed25519",
-}
+BLOCKED_FILE_PATTERNS = tuple(
+    pattern.lower()
+    for pattern in CONFIGURATION["context"]["blocked_file_patterns"]
+)
+_LOG_LOCK = threading.Lock()
+SENSITIVE_CONTENT_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----",
+    r"\b(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*['\"]?[^\s'\"]{8,}",
+    r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})\b",
+))
 
 
 # ==========================================
@@ -113,7 +135,10 @@ def read_task_files(prompt):
         try:
             file_path = (project_root / reference).resolve()
 
-            if not file_path.is_relative_to(project_root):
+            if (
+                CONFIGURATION["context"]["restrict_workspace"]
+                and not file_path.is_relative_to(project_root)
+            ):
                 print(f"[FILE CONTEXT] BLOCKED: {reference}")
                 continue
 
@@ -121,7 +146,10 @@ def read_task_files(prompt):
                 print(f"[FILE CONTEXT] NOT FOUND: {reference}")
                 continue
 
-            if file_path.name.lower() in BLOCKED_NAMES:
+            if any(
+                fnmatch.fnmatch(file_path.name.lower(), pattern)
+                for pattern in BLOCKED_FILE_PATTERNS
+            ):
                 print(
                     f"[FILE CONTEXT] BLOCKED SENSITIVE FILE: "
                     f"{reference}"
@@ -141,6 +169,12 @@ def read_task_files(prompt):
                 encoding="utf-8-sig"
             )
 
+            if CONFIGURATION["context"].get("scan_secret_content", True) and any(
+                pattern.search(content) for pattern in SENSITIVE_CONTENT_PATTERNS
+            ):
+                print(f"[FILE CONTEXT] BLOCKED SENSITIVE CONTENT: {reference}")
+                continue
+
             if total_size + len(content) > MAX_TOTAL_CONTEXT:
                 print(
                     f"[FILE CONTEXT] TOTAL LIMIT REACHED: "
@@ -157,7 +191,8 @@ def read_task_files(prompt):
             loaded_files.append(reference)
             total_size += len(content)
 
-            print(f"[FILE CONTEXT] LOADED: {reference}")
+            if CONFIGURATION["context"]["show_loaded_files"]:
+                print(f"[FILE CONTEXT] LOADED: {reference}")
 
         except UnicodeDecodeError:
             print(
@@ -397,36 +432,16 @@ def validate_agent_result(result, task, agent):
 
 
 # ==========================================
-# COMMAND BUILDER
-# ==========================================
-
-def build_command(agent, prompt):
-
-    if agent == "codex":
-        return [
-            "codex",
-            "exec",
-            "--sandbox", "read-only",
-            "-C", str(PROJECT_ROOT),
-            prompt,
-        ]
-
-    if agent == "antigravity":
-        return [
-            "agy",
-            "--mode", "plan",
-            "--sandbox",
-            f"--print={prompt}",
-        ]
-
-    raise ValueError(f"Unknown agent: {agent}")
-
-
-# ==========================================
 # LOGGING
 # ==========================================
 
-def save_log(
+def save_log(*args, **kwargs):
+    """Write one complete log record at a time when agents run concurrently."""
+    with _LOG_LOCK:
+        return _save_log_unlocked(*args, **kwargs)
+
+
+def _save_log_unlocked(
     agent,
     prompt,
     output,
@@ -436,6 +451,9 @@ def save_log(
     duration,
     structured_result=None,
 ):
+
+    if not CONFIGURATION["preserve_logs"]:
+        return
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -447,12 +465,21 @@ def save_log(
         file.write(f"Status: {status}\n")
         file.write(f"Return code: {return_code}\n")
         file.write(f"Duration: {duration:.2f}s\n")
-        file.write(f"Prompt:\n{prompt}\n")
+        if CONFIGURATION["logging"]["include_prompt"]:
+            file.write(f"Prompt:\n{prompt}\n")
+        else:
+            file.write("Prompt: [omitted by logging policy]\n")
 
-        file.write("\n--- RAW OUTPUT ---\n")
-        file.write(output or "")
+        if CONFIGURATION["logging"]["include_raw_output"]:
+            file.write("\n--- RAW OUTPUT ---\n")
+            file.write(output or "")
+        else:
+            file.write("\n--- RAW OUTPUT ---\n[omitted by logging policy]\n")
 
-        if structured_result is not None:
+        if (
+            structured_result is not None
+            and CONFIGURATION["logging"]["include_structured_result"]
+        ):
 
             file.write("\n--- STRUCTURED RESULT ---\n")
 
@@ -464,9 +491,12 @@ def save_log(
                 )
             )
 
-        file.write("\n--- STDERR / DIAGNOSTICS ---\n")
-        file.write(error or "")
-        file.write("\n")
+        if CONFIGURATION["logging"]["include_diagnostics"]:
+            file.write("\n--- STDERR / DIAGNOSTICS ---\n")
+            file.write(error or "")
+            file.write("\n")
+        else:
+            file.write("\n--- STDERR / DIAGNOSTICS ---\n[omitted by logging policy]\n")
 
 
 # ==========================================
@@ -499,6 +529,49 @@ def save_structured_result(agent, task_id, structured_result):
 # ==========================================
 
 def run_agent(agent, prompt, previous_result=None, workflow_id=None):
+    """Execute an agent and persist elapsed time even when it fails."""
+    start_time = time.perf_counter()
+    try:
+        return _run_agent(agent, prompt, previous_result, workflow_id)
+    finally:
+        if workflow_id is not None:
+            elapsed = time.perf_counter() - start_time
+            try:
+                task_manager.state_manager.record_agent_metrics(
+                    workflow_id,
+                    agent,
+                    elapsed,
+                )
+            except Exception as exc:
+                print(f"[{agent.upper()}] Could not save run metrics: {exc}")
+
+
+def run_agent_with_retries(
+    agent,
+    prompt,
+    previous_result=None,
+    workflow_id=None,
+):
+    """Retry a failed agent call up to the configured bounded limit."""
+    for attempt in range(CONFIGURATION["max_retries"] + 1):
+        result = run_agent(
+            agent,
+            prompt,
+            previous_result,
+            workflow_id=workflow_id,
+        )
+        if result:
+            return result
+        if attempt < CONFIGURATION["max_retries"]:
+            print(
+                f"[{agent.upper()}] Attempt {attempt + 1} failed; "
+                f"retrying ({attempt + 2}/"
+                f"{CONFIGURATION['max_retries'] + 1})."
+            )
+    return False
+
+
+def _run_agent(agent, prompt, previous_result=None, workflow_id=None):
 
     print(f"\n[{agent.upper()}] Starting...")
 
@@ -557,15 +630,43 @@ def run_agent(agent, prompt, previous_result=None, workflow_id=None):
     print(f"[{agent.upper()}] TASK VALIDATION: SUCCESS")
     print(f"[{agent.upper()}] Task ID: {task['task_id']}")
 
-    executable = (
-        "codex"
-        if agent == "codex"
-        else "agy"
-    )
+    agent_config = CONFIGURATION["agents"].get(agent)
+    if agent_config is None:
+        message = f"Agent is not enabled in config/agents.yaml: {agent}"
 
-    if shutil.which(executable) is None:
+        print(f"\n[{agent.upper()}] FAILED: {message}")
 
-        message = f"Cannot find CLI: {executable}"
+        save_log(
+            agent,
+            prompt,
+            "",
+            message,
+            -1,
+            "FAILED",
+            time.perf_counter() - start_time,
+        )
+
+        return False
+
+    try:
+        executable_available = agent_adapters.is_available(
+            agent,
+            agent_config,
+        )
+        executable = agent_adapters.executable_for(agent, agent_config)
+    except agent_adapters.AgentAdapterError as exc:
+        executable_available = False
+        executable = "(configuration error)"
+        adapter_error = str(exc)
+    else:
+        adapter_error = None
+
+    if not executable_available:
+
+        message = adapter_error or (
+            f"Cannot find CLI '{executable}' for agent '{agent}'. "
+            "Install it or update config/agents.yaml."
+        )
 
         print(f"\n[{agent.upper()}] FAILED: {message}")
 
@@ -593,25 +694,15 @@ def run_agent(agent, prompt, previous_result=None, workflow_id=None):
             f"Received handoff from {previous_result['agent']}."
         )
 
-    command = build_command(
-        agent,
-        structured_prompt
-    )
-
     try:
 
-        result = subprocess.run(
-            command,
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=TIMEOUT_SECONDS,
-            shell=False,
-            check=False,
+        result = agent_adapters.run(
+            agent=agent,
+            prompt=structured_prompt,
+            agent_config=agent_config,
+            project_root=PROJECT_ROOT,
+            timeout_seconds=TIMEOUT_SECONDS,
         )
-
         duration = time.perf_counter() - start_time
 
         output = result.stdout or ""
@@ -833,6 +924,29 @@ def run_final_synthesizer(
     agent_results,
     workflow_id,
 ):
+    """Run synthesis and persist its elapsed time in workflow telemetry."""
+    started = time.perf_counter()
+    try:
+        return _run_final_synthesizer(
+            original_prompt,
+            agent_results,
+            workflow_id,
+        )
+    finally:
+        try:
+            task_manager.state_manager.record_synthesis_metrics(
+                workflow_id,
+                time.perf_counter() - started,
+            )
+        except Exception as exc:
+            print(f"[SYNTHESIZER] Could not save timing metrics: {exc}")
+
+
+def _run_final_synthesizer(
+    original_prompt,
+    agent_results,
+    workflow_id,
+):
     """
     Use Codex to synthesize validated results.
     Save the final report as Markdown.
@@ -841,18 +955,6 @@ def run_final_synthesizer(
     print("\n" + "=" * 50)
     print("FINAL SYNTHESIZER")
     print("=" * 50)
-
-    required_agents = {"codex", "antigravity"}
-
-    received_agents = {
-        result.get("agent")
-        for result in agent_results
-        if isinstance(result, dict)
-    }
-
-    if not required_agents.issubset(received_agents):
-        print("[SYNTHESIZER] Missing required agent results.")
-        return False
 
     for result in agent_results:
 
@@ -863,8 +965,16 @@ def run_final_synthesizer(
             )
             return False
 
-    if shutil.which("codex") is None:
-        print("[SYNTHESIZER] Cannot find Codex CLI.")
+    codex_config = CONFIGURATION["agents"].get("codex")
+    if codex_config is None:
+        print("[SYNTHESIZER] Codex must be enabled to synthesize reports.")
+        return False
+
+    if not agent_adapters.is_available("codex", codex_config):
+        print(
+            "[SYNTHESIZER] Codex CLI was not found at "
+            f"'{codex_config['command']}'."
+        )
         return False
 
     # Only pass validated results from this workflow.
@@ -925,11 +1035,6 @@ Do not use Markdown code fences.
 Return Markdown only.
 """
 
-    command = build_command(
-        "codex",
-        synthesis_prompt
-    )
-
     print("[SYNTHESIZER] Using Codex.")
     print("[SYNTHESIZER] Combining agent results...")
 
@@ -937,16 +1042,11 @@ Return Markdown only.
 
     try:
 
-        result = subprocess.run(
-            command,
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=TIMEOUT_SECONDS,
-            shell=False,
-            check=False,
+        result = agent_adapters.run_codex(
+            prompt=synthesis_prompt,
+            agent_config=codex_config,
+            project_root=PROJECT_ROOT,
+            timeout_seconds=TIMEOUT_SECONDS,
         )
 
         duration = time.perf_counter() - start_time
@@ -1044,8 +1144,7 @@ def select_recovery_workflow():
     for index, workflow in enumerate(candidates, start=1):
         print(
             f"{index}. {workflow['workflow_id']} "
-            f"| Status: {workflow['status']} "
-            f"| Task: {workflow['task'][:70]}"
+            f"| Status: {workflow['status']}"
         )
 
     print("0. Cancel")
@@ -1069,6 +1168,16 @@ def select_recovery_workflow():
         return None
 
 def resume_workflow(workflow_id):
+    """Resume a workflow only when this process can claim its lease."""
+    try:
+        with recovery_manager.state_manager.workflow_lease(workflow_id):
+            return _resume_workflow(workflow_id)
+    except recovery_manager.state_manager.WorkflowBusyError as exc:
+        print(f"[RECOVERY] {exc}")
+        return 1
+
+
+def _resume_workflow(workflow_id):
     """Resume an interrupted workflow using validated stored results."""
 
     print("\n" + "=" * 50)
@@ -1086,9 +1195,10 @@ def resume_workflow(workflow_id):
 
         if not plan["recoverable"]:
             print("\nWorkflow cannot be recovered.")
-            return
+            return 1
 
         original_prompt = workflow["task"]
+        parallel_recovery = workflow.get("execution_mode") == "parallel"
 
         selected_agents = list(workflow["agents"].keys())
 
@@ -1111,10 +1221,10 @@ def resume_workflow(workflow_id):
 
         for agent in selected_agents:
 
-            if agent in pending_agents:
+            if not parallel_recovery and agent in pending_agents:
                 retry_chain_started = True
 
-            if retry_chain_started:
+            if not parallel_recovery and retry_chain_started:
                 pending_agents.add(agent)
             elif agent in completed_results:
                 reusable_results[agent] = completed_results[agent]
@@ -1153,11 +1263,38 @@ def resume_workflow(workflow_id):
         previous_result = None
         failed = False
 
+        if parallel_recovery:
+            parallel_agents = [
+                agent for agent in selected_agents
+                if agent in pending_agents
+            ]
+            parallel_results = run_parallel_agents(
+                original_prompt,
+                parallel_agents,
+                workflow_id,
+            ) if parallel_agents else []
+            results_by_agent = dict(reusable_results)
+            results_by_agent.update(
+                (agent, result)
+                for agent, result in zip(parallel_agents, parallel_results)
+                if result
+            )
+            failed = any(not result for result in parallel_results)
+            agent_results = [
+                results_by_agent[agent]
+                for agent in selected_agents
+                if agent in results_by_agent
+            ]
+            print(
+                "[RECOVERY] Parallel workflow recovery; "
+                "independent agents are resumed without handoff."
+            )
+
         # ----------------------------------
         # Execute agents in original order
         # ----------------------------------
 
-        for agent in selected_agents:
+        for agent in ([] if parallel_recovery else selected_agents):
 
             # Reuse valid previous result.
             if agent in reusable_results:
@@ -1189,7 +1326,7 @@ def resume_workflow(workflow_id):
                 agent,
             )
 
-            result = run_agent(
+            result = run_agent_with_retries(
                 agent,
                 original_prompt,
                 previous_result,
@@ -1297,13 +1434,15 @@ def resume_workflow(workflow_id):
 
         print(
             f"Successful agents: "
-            f"{len(agent_results)}/{len(selected_agents)}"
+            f"{sum(bool(result) for result in agent_results)}"
+            f"/{len(selected_agents)}"
         )
 
         if final_report:
             print("Final report:", final_report)
 
         print("\nWorkflow state saved successfully.")
+        return 0 if final_state["status"] == "SUCCESS" else 1
 
     except Exception as exc:
 
@@ -1317,77 +1456,149 @@ def resume_workflow(workflow_id):
             )
         except Exception as state_exc:
             print("[RECOVERY] Cannot update workflow state:", state_exc)
+        return 1
 
             
 # ==========================================
 # MAIN
 # ==========================================
 
-def main():
+def main(argv=None):
+    """Delegate command-line parsing and interaction to orchestrator.cli."""
+    try:
+        from .cli import main as cli_main
+    except ImportError:
+        from cli import main as cli_main
+    return cli_main(argv, runtime=sys.modules[__name__])
 
-    print("=" * 50)
-    print("PERSONAL AI TEAM - ORCHESTRATOR")
-    print("=" * 50)
 
-    print("\nSelect operation:")
-    print("1. Codex")
-    print("2. Antigravity")
-    print("3. Both (sequential + synthesis)")
-    print("4. Resume interrupted workflow")
+def _run_parallel_agent(agent, prompt, workflow_id):
+    """Run and persist one independent agent in a worker thread."""
+    try:
+        task_manager.start_agent(workflow_id, agent)
+        result = run_agent_with_retries(
+            agent,
+            prompt,
+            previous_result=None,
+            workflow_id=workflow_id,
+        )
+        if not result:
+            task_manager.fail_agent(
+                workflow_id,
+                agent,
+                error="Agent execution failed or returned an invalid result.",
+            )
+            return False
 
-    choice = input("\nYour choice: ").strip()
+        result_file = RESULT_DIR / f"{result['task_id']}_{agent}.json"
+        task_manager.complete_agent(
+            workflow_id=workflow_id,
+            agent=agent,
+            task_id=result["task_id"],
+            result_file=result_file,
+        )
+        return result
+    except Exception as exc:
+        try:
+            task_manager.fail_agent(
+                workflow_id,
+                agent,
+                error=f"Parallel agent execution error: {exc}",
+            )
+        except Exception as state_exc:
+            print(
+                f"[{agent.upper()}] Could not record failure: {state_exc}"
+            )
+        print(f"[{agent.upper()}] Parallel execution failed: {exc}")
+        return False
 
-    # --------------------------------------
-    # 1. RECOVERY MODE
-    # --------------------------------------
 
-    if choice == "4":
+def run_parallel_agents(prompt, selected_agents, workflow_id):
+    """Execute independent agents concurrently, preserving configured result order."""
+    results = {}
+    with ThreadPoolExecutor(
+        max_workers=min(len(selected_agents), CONFIGURATION["max_agents"]),
+        thread_name_prefix="agent",
+    ) as executor:
+        futures = {
+            executor.submit(
+                _run_parallel_agent,
+                agent,
+                prompt,
+                workflow_id,
+            ): agent
+            for agent in selected_agents
+        }
+        for future in as_completed(futures):
+            agent = futures[future]
+            try:
+                results[agent] = future.result()
+            except Exception as exc:
+                print(f"[{agent.upper()}] Worker crashed: {exc}")
+                try:
+                    task_manager.fail_agent(
+                        workflow_id,
+                        agent,
+                        error=f"Parallel worker crashed: {exc}",
+                    )
+                except Exception as state_exc:
+                    print(
+                        f"[{agent.upper()}] Could not record failure: "
+                        f"{state_exc}"
+                    )
+                results[agent] = False
+    return [results.get(agent, False) for agent in selected_agents]
 
-        workflow_id = select_recovery_workflow()
 
-        if workflow_id:
-            resume_workflow(workflow_id)
-
-        return
-
-    # --------------------------------------
-    # 2. NEW WORKFLOW MODE
-    # --------------------------------------
-
-    if choice not in AGENTS:
-        print("Invalid choice.")
-        return
-
-    prompt = read_multiline_prompt()
+def run_workflow(prompt, selected_agents, parallel=False):
+    """Create a workflow, claim it, and execute it exactly once."""
 
     if not prompt:
         print("Task cannot be empty.")
-        return
+        return 2
 
-    selected_agents = AGENTS[choice]
+    if len(selected_agents) > CONFIGURATION["max_agents"]:
+        print(
+            "Selected workflow exceeds configured maximum of "
+            f"{CONFIGURATION['max_agents']} agent(s)."
+        )
+        return 2
 
-    print(
-        "\nSelected agents:",
-        ", ".join(selected_agents)
-    )
+    if parallel and not CONFIGURATION["allow_parallel_execution"]:
+        print("Parallel execution is disabled by policy.")
+        return 2
 
-    # --------------------------------------
-    # 3. CREATE WORKFLOW
-    # --------------------------------------
+    if parallel and len(selected_agents) < 2:
+        print("Parallel execution requires at least two selected agents.")
+        return 2
 
     try:
         workflow = task_manager.create_task(
             task=prompt,
             agents=selected_agents,
+            execution_mode="parallel" if parallel else "sequential",
         )
-
         workflow_id = workflow["workflow_id"]
-
-        task_manager.start_task(workflow_id)
-
+        # The workflow stays PENDING until its process lease is held, so a
+        # different CLI process will not advertise it for recovery meanwhile.
+        with task_manager.state_manager.workflow_lease(workflow_id):
+            task_manager.start_task(workflow_id)
+            return _execute_workflow(
+                prompt,
+                selected_agents,
+                parallel,
+                workflow_id,
+            )
+    except task_manager.state_manager.WorkflowBusyError as exc:
+        print(f"[TASK MANAGER] {exc}")
+        return 1
     except Exception as exc:
-        print(f"\n[TASK MANAGER] Cannot create workflow: {exc}")
-        return
+        print(f"\n[TASK MANAGER] Cannot create or start workflow: {exc}")
+        return 1
+
+
+def _execute_workflow(prompt, selected_agents, parallel, workflow_id):
+    """Execute and finalize a workflow while its process lease is held."""
 
     print("\n" + "=" * 50)
     print("WORKFLOW CREATED")
@@ -1398,11 +1609,19 @@ def main():
     previous_result = None
     agent_results = []
 
+    if parallel:
+        print("Execution mode: parallel; agents receive the original task independently.")
+        agent_results = run_parallel_agents(
+            prompt,
+            selected_agents,
+            workflow_id,
+        )
+
     # --------------------------------------
     # 4. RUN SELECTED AGENTS SEQUENTIALLY
     # --------------------------------------
 
-    for index, agent in enumerate(selected_agents):
+    for index, agent in enumerate([] if parallel else selected_agents):
 
         if index > 0 and previous_result is not None:
 
@@ -1427,7 +1646,7 @@ def main():
             )
             break
 
-        result = run_agent(
+        result = run_agent_with_retries(
             agent,
             prompt,
             previous_result,
@@ -1496,9 +1715,13 @@ def main():
 
     final_report = False
 
-    if choice == "3" and len(agent_results) == 2:
+    if (
+        len(selected_agents) > 1
+        and len(agent_results) == len(selected_agents)
+        and all(agent_results)
+    ):
 
-        print("\nBoth agents completed successfully.")
+        print("\nAll selected agents completed successfully.")
 
         final_report = run_final_synthesizer(
             prompt,
@@ -1512,11 +1735,11 @@ def main():
                 "Final report generation failed."
             )
 
-    elif choice == "3":
+    elif len(selected_agents) > 1:
 
         print(
             "\n[SYNTHESIZER] Skipped because "
-            "both agents did not complete successfully."
+            "all selected agents did not complete successfully."
         )
 
     # --------------------------------------
@@ -1532,8 +1755,9 @@ def main():
 
         # Both agents succeeded, but synthesis failed.
         if (
-            choice == "3"
-            and len(agent_results) == 2
+            len(selected_agents) > 1
+            and len(agent_results) == len(selected_agents)
+            and all(agent_results)
             and not final_report
         ):
 
@@ -1567,6 +1791,7 @@ def main():
         print("Results directory:", RESULT_DIR)
 
         print("\nWorkflow state saved successfully.")
+        return 0 if final_state["status"] == "SUCCESS" else 1
 
     except Exception as exc:
 
@@ -1574,7 +1799,8 @@ def main():
             f"\n[TASK MANAGER] "
             f"Failed to finalize workflow: {exc}"
         )
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

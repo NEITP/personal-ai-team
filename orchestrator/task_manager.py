@@ -11,12 +11,13 @@ except ImportError:
 # TASK MANAGER
 # ==========================================
 
-def create_task(task, agents):
+def create_task(task, agents, execution_mode="sequential"):
     """Create a new workflow."""
 
     return state_manager.create_workflow(
         original_task=task,
         agents=agents,
+        execution_mode=execution_mode,
     )
 
 
