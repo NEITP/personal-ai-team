@@ -1,6 +1,7 @@
 """Load and normalize the workspace's YAML configuration."""
 
 from pathlib import Path
+import re
 
 import yaml
 
@@ -8,11 +9,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = PROJECT_ROOT / "config"
 
-AGENT_ALIASES = {
-    "orchestrator": "codex",
-    "researcher": "antigravity",
-    "local": "ollama",
-}
+AGENT_ALIASES = {}
 
 
 def _read_yaml(filename):
@@ -32,9 +29,11 @@ def load_configuration():
 
     agents = {}
     for key, entry in agents_data.get("agents", {}).items():
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", key):
+            raise ValueError(f"Invalid agent ID: {key!r}")
         if not isinstance(entry, dict):
             raise ValueError(f"Agent configuration must be a mapping: {key}")
-        name = AGENT_ALIASES.get(key, key)
+        name = str(key)
         if entry.get("enabled", False):
             agents[name] = {
                 **entry,
@@ -43,14 +42,17 @@ def load_configuration():
             }
 
     routes = routing_data.get("routing", {})
-    if not agents:
-        raise ValueError("At least one configured agent must be enabled.")
-    if not routes:
-        raise ValueError("At least one task routing rule is required.")
+    if not isinstance(routes, dict):
+        raise ValueError("routing must be a mapping.")
 
     execution = routing_data.get("execution", {})
     policy_execution = policies.get("execution", {})
     settings = agents_data.get("settings", {})
+    synthesis_agent = settings.get("synthesis_agent")
+    if synthesis_agent is not None and synthesis_agent not in agents:
+        raise ValueError(
+            "settings.synthesis_agent must reference an enabled agent."
+        )
     logging = policies.get("logging", {})
     context = policies.get("context", {})
     security = policies.get("security", {})
@@ -68,6 +70,8 @@ def load_configuration():
             "execution.mode is parallel but execution.allow_parallel is false."
         )
     for route_name, route in routes.items():
+        if not isinstance(route_name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", route_name):
+            raise ValueError(f"Invalid route name: {route_name!r}")
         if not isinstance(route, dict):
             raise ValueError(f"Route must be a mapping: {route_name}")
         route_mode = route.get("execution", "sequential")
@@ -83,13 +87,11 @@ def load_configuration():
             raise ValueError(
                 f"Route {route_name} requires review and cannot run in parallel."
             )
-    if any(
-        route.get("execution") == "parallel" for route in routes.values()
-    ) and not allow_parallel:
+    if any(route.get("execution") == "parallel" for route in routes.values()) and not allow_parallel:
         raise ValueError(
             "A route requires parallel execution while execution.allow_parallel is false."
         )
-    max_agents = execution.get("max_agents_per_task", 2)
+    max_agents = execution.get("max_agents_per_task", max(1, len(agents)))
     if isinstance(max_agents, bool) or not isinstance(max_agents, int) or max_agents < 1:
         raise ValueError("max_agents_per_task must be a positive integer.")
 
@@ -114,6 +116,7 @@ def load_configuration():
     ]
     return {
         "agents": agents,
+        "synthesis_agent": synthesis_agent,
         "routes": routes,
         "max_agents": max_agents,
         "timeout_seconds": policy_execution.get("timeout_seconds", 900),

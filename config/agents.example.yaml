@@ -1,0 +1,29 @@
+version: 1
+
+agents:
+  assistant:
+    name: My Assistant
+    enabled: true
+    adapter: command
+    command: my-ai-cli
+    # The {prompt} placeholder is replaced with the task and sent as an arg.
+    args: ["--prompt", "{prompt}"]
+    prompt_mode: argument
+    version_args: ["--version"]
+
+  # Add more entries with unique IDs and CLIs you have installed.
+  # reviewer:
+  #   name: My Reviewer
+  #   enabled: true
+  #   adapter: command
+  #   command: another-ai-cli
+  #   args: ["--prompt", "{prompt}"]
+  #   prompt_mode: argument
+
+settings:
+  require_human_approval: true
+  auto_commit: false
+  auto_merge: false
+  # Optional: ID of a configured agent used for LLM-based report synthesis.
+  # Omit it to assemble a report directly from the agent results.
+  # synthesis_agent: assistant

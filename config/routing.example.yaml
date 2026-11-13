@@ -1,0 +1,20 @@
+version: 1
+
+routing:
+  ask_assistant:
+    primary: assistant
+    execution: sequential
+
+  # Uncomment after configuring a reviewer agent above.
+  # review_with_two_agents:
+  #   primary: assistant
+  #   reviewer: reviewer
+  #   require_review: true
+  #   execution: sequential
+
+execution:
+  mode: sequential
+  allow_parallel: true
+  max_agents_per_task: 4
+  max_retries: 1
+  reuse_previous_results: true

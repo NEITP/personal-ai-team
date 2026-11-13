@@ -27,7 +27,7 @@
     },
     "assigned_to": {
       "type": "string",
-      "enum": ["codex", "antigravity", "ollama"]
+      "minLength": 1
     },
     "task_type": {
       "type": "string",

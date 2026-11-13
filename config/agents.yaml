@@ -1,22 +1,7 @@
-﻿agents:
-  orchestrator:
-    name: Codex
-    command: codex
-    role: primary
-    enabled: true
+version: 1
 
-  researcher:
-    name: Antigravity
-    command: agy
-    role: research
-    enabled: true
-
-  local:
-    name: Ollama
-    command: ollama
-    model: llama3.2
-    role: local
-    enabled: true
+# Add the CLI agents you want to use. See agents.example.yaml.
+agents: {}
 
 settings:
   require_human_approval: true

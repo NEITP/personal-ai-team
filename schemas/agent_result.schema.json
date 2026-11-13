@@ -28,7 +28,7 @@
     },
     "agent": {
       "type": "string",
-      "enum": ["codex", "antigravity", "ollama"]
+      "minLength": 1
     },
     "status": {
       "type": "string",

@@ -83,8 +83,51 @@ def _assert_ollama_model_installed(executable, model):
 def build_command(agent, prompt, agent_config, project_root):
     """Build a shell-free command and return its optional stdin payload."""
     executable = executable_for(agent, agent_config)
+    adapter = agent_config.get(
+        "adapter",
+        agent if agent in {"codex", "antigravity", "ollama"} else "command",
+    )
 
-    if agent == "codex":
+    if adapter == "command":
+        args = agent_config.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise AgentAdapterError(
+                f"Agent '{agent}' args must be a list of strings."
+            )
+        replacements = {
+            "{prompt}": prompt,
+            "{project_root}": str(project_root),
+            "{agent}": agent,
+        }
+        command = [executable]
+        prompt_in_args = False
+        for arg in args:
+            for placeholder, value in replacements.items():
+                if placeholder in arg:
+                    if placeholder == "{prompt}":
+                        prompt_in_args = True
+                    arg = arg.replace(placeholder, value)
+            command.append(arg)
+        prompt_mode = agent_config.get(
+            "prompt_mode", "argument" if prompt_in_args else "stdin"
+        )
+        if prompt_mode == "stdin":
+            if prompt_in_args:
+                raise AgentAdapterError(
+                    f"Agent '{agent}' cannot use {{prompt}} in args and stdin prompt_mode together."
+                )
+            return command, prompt
+        if prompt_mode == "argument":
+            if not prompt_in_args:
+                raise AgentAdapterError(
+                    f"Agent '{agent}' uses argument prompt_mode but args omit {{prompt}}."
+                )
+            return command, None
+        raise AgentAdapterError(
+            f"Agent '{agent}' prompt_mode must be 'stdin' or 'argument'."
+        )
+
+    if adapter == "codex":
         return [
             executable,
             "exec",
@@ -93,7 +136,7 @@ def build_command(agent, prompt, agent_config, project_root):
             "-",
         ], prompt
 
-    if agent == "antigravity":
+    if adapter == "antigravity":
         return [
             executable,
             "--mode", "plan",
@@ -101,7 +144,7 @@ def build_command(agent, prompt, agent_config, project_root):
             f"--print={prompt}",
         ], None
 
-    if agent == "ollama":
+    if adapter == "ollama":
         model = agent_config.get("model")
         if not model:
             raise AgentAdapterError(
@@ -110,7 +153,9 @@ def build_command(agent, prompt, agent_config, project_root):
             )
         return [executable, "run", model], prompt
 
-    raise AgentAdapterError(f"No adapter is registered for agent: {agent}")
+    raise AgentAdapterError(
+        f"Unknown adapter '{adapter}' for agent '{agent}'."
+    )
 
 
 def run(agent, prompt, agent_config, project_root, timeout_seconds):
@@ -121,7 +166,11 @@ def run(agent, prompt, agent_config, project_root, timeout_seconds):
         agent_config,
         project_root,
     )
-    if agent == "ollama":
+    adapter = agent_config.get(
+        "adapter",
+        agent if agent in {"codex", "antigravity", "ollama"} else "command",
+    )
+    if adapter == "ollama":
         _assert_ollama_model_installed(
             executable_for(agent, agent_config),
             agent_config["model"],

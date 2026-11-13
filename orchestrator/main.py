@@ -39,17 +39,10 @@ TIMEOUT_SECONDS = CONFIGURATION["timeout_seconds"]
 MAX_FILE_SIZE = CONFIGURATION["context"]["max_file_size_bytes"]
 MAX_TOTAL_CONTEXT = CONFIGURATION["context"]["max_total_characters"]
 
-AGENTS = {
-    "1": ["codex"],
-    "2": ["antigravity"],
-    "3": ["codex", "antigravity"],
-    "6": ["ollama"],
-}
 prune_workflows = retention.prune_completed_workflows
 AGENTS = {
-    choice: selected
-    for choice, selected in AGENTS.items()
-    if all(agent in CONFIGURATION["agents"] for agent in selected)
+    str(index): [agent]
+    for index, agent in enumerate(CONFIGURATION["agents"], start=1)
 }
 
 SUPPORTED_EXTENSIONS = {
@@ -965,15 +958,34 @@ def _run_final_synthesizer(
             )
             return False
 
-    codex_config = CONFIGURATION["agents"].get("codex")
-    if codex_config is None:
-        print("[SYNTHESIZER] Codex must be enabled to synthesize reports.")
-        return False
+    synthesizer_id = CONFIGURATION.get("synthesis_agent")
+    synthesizer_config = CONFIGURATION["agents"].get(synthesizer_id)
+    if synthesizer_config is None:
+        print("[SYNTHESIZER] No synthesis agent configured; assembling agent results.")
+        sections = ["# Workflow Report", "", "## Task", "", original_prompt, ""]
+        for result in agent_results:
+            sections.extend([
+                f"## {result.get('agent', 'Agent')}", "",
+                result.get("summary", ""), "",
+                "### Findings", "",
+                *[f"- {item}" for item in result.get("findings", [])], "",
+                "### Risks", "",
+                *[f"- {item}" for item in result.get("risks", [])], "",
+                "### Recommendations", "",
+                *[f"- {item}" for item in result.get("recommendations", [])], "",
+            ])
+        RESULT_DIR.mkdir(parents=True, exist_ok=True)
+        report_file = RESULT_DIR / f"FINAL-WORKFLOW-{workflow_id}.md"
+        temp_file = report_file.with_suffix(".md.tmp")
+        temp_file.write_text("\n".join(sections).rstrip() + "\n", encoding="utf-8")
+        temp_file.replace(report_file)
+        task_manager.state_manager.set_final_report(workflow_id, report_file)
+        return str(report_file.relative_to(PROJECT_ROOT))
 
-    if not agent_adapters.is_available("codex", codex_config):
+    if not agent_adapters.is_available(synthesizer_id, synthesizer_config):
         print(
-            "[SYNTHESIZER] Codex CLI was not found at "
-            f"'{codex_config['command']}'."
+            f"[SYNTHESIZER] CLI for '{synthesizer_id}' was not found at "
+            f"'{synthesizer_config['command']}'."
         )
         return False
 
@@ -1035,16 +1047,17 @@ Do not use Markdown code fences.
 Return Markdown only.
 """
 
-    print("[SYNTHESIZER] Using Codex.")
+    print(f"[SYNTHESIZER] Using {synthesizer_id}.")
     print("[SYNTHESIZER] Combining agent results...")
 
     start_time = time.perf_counter()
 
     try:
 
-        result = agent_adapters.run_codex(
+        result = agent_adapters.run(
+            agent=synthesizer_id,
             prompt=synthesis_prompt,
-            agent_config=codex_config,
+            agent_config=synthesizer_config,
             project_root=PROJECT_ROOT,
             timeout_seconds=TIMEOUT_SECONDS,
         )

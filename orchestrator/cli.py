@@ -17,21 +17,19 @@ def build_cli_parser(configuration):
     run_parser = commands.add_parser("run", help="Run a task workflow")
     run_parser.add_argument("task", nargs="+", help="Task prompt")
     run_mode = run_parser.add_mutually_exclusive_group()
+    route_options = {"choices": sorted(configuration["routes"])} if configuration["routes"] else {}
     run_mode.add_argument(
-        "--route",
-        choices=sorted(configuration["routes"]),
+        "--route", **route_options,
         help="Choose a configured task route",
     )
+    agent_choices = list(configuration["agents"])
+    if len(agent_choices) > 1:
+        agent_choices.append("all")
+    agent_options = {"choices": agent_choices} if agent_choices else {}
     run_mode.add_argument(
         "--agent",
-        choices=(
-            list(configuration["agents"])
-            + (["both"] if all(
-                agent in configuration["agents"]
-                for agent in ("codex", "antigravity")
-            ) else [])
-        ),
-        help="Run one agent or both configured primary agents",
+        **agent_options,
+        help="Run one configured agent, or all configured agents",
     )
     parallel_mode = run_parser.add_mutually_exclusive_group()
     parallel_mode.add_argument(
@@ -157,19 +155,26 @@ def _select_agents(runtime, cli_args):
             runtime.CONFIGURATION,
             cli_args.route,
         )
-    if cli_args.agent == "both":
-        return ["codex", "antigravity"]
+    if cli_args.agent == "all":
+        return list(runtime.CONFIGURATION["agents"])
     if cli_args.agent:
+        if cli_args.agent not in runtime.CONFIGURATION["agents"]:
+            raise ValueError(f"Agent '{cli_args.agent}' is not configured and enabled.")
         return [cli_args.agent]
-    return runtime.agents_for_route(
-        runtime.CONFIGURATION,
-        "simple_questions",
-    )
+    if runtime.CONFIGURATION["routes"]:
+        first_route = next(iter(runtime.CONFIGURATION["routes"]))
+        return runtime.agents_for_route(runtime.CONFIGURATION, first_route)
+    if runtime.CONFIGURATION["agents"]:
+        return [next(iter(runtime.CONFIGURATION["agents"]))]
+    raise ValueError("No agents are configured. Add one in config/agents.yaml first.")
 
 
 def _run_cli_command(runtime, cli_args):
     if cli_args.command == "doctor":
         failed = False
+        if not runtime.CONFIGURATION["agents"]:
+            print("[INFO] No agents configured. Add one in config/agents.yaml.")
+            return 0
         for agent, agent_config in runtime.CONFIGURATION["agents"].items():
             try:
                 if not runtime.agent_adapters.is_available(agent, agent_config):
@@ -181,9 +186,6 @@ def _run_cli_command(runtime, cli_args):
             except runtime.agent_adapters.AgentAdapterError as exc:
                 print(f"[ERROR] {agent}: {exc}")
                 failed = True
-        if len(runtime.CONFIGURATION["agents"]) > 1 and "codex" not in runtime.CONFIGURATION["agents"]:
-            print("[ERROR] Codex must be enabled to synthesize multi-agent results.")
-            failed = True
         return 1 if failed else 0
 
     if cli_args.command == "status":
@@ -268,27 +270,27 @@ def _run_interactive(runtime):
     print("PERSONAL AI TEAM - ORCHESTRATOR")
     print("=" * 50)
     print("\nSelect operation:")
-    menu_labels = {
-        "1": "Codex",
-        "2": "Antigravity",
-        "3": "Both (sequential + synthesis)",
-        "6": "Ollama (local model)",
-    }
-    for menu_key, label in menu_labels.items():
-        if menu_key in runtime.AGENTS:
-            print(f"{menu_key}. {label}")
-    print("4. Resume interrupted workflow")
-    print("5. Route by task type (from config/routing.yaml)")
+    print("\\nConfigured agents:")
+    if not runtime.AGENTS:
+        print("  None yet. Add agents in config/agents.yaml, then restart.")
+    for menu_key, selected in runtime.AGENTS.items():
+        agent = selected[0]
+        label = runtime.CONFIGURATION["agents"][agent].get("name", agent)
+        print(f"{menu_key}. {label} ({agent})")
+    route_key, resume_key = "r", "s"
+    if runtime.CONFIGURATION["routes"]:
+        print(f"{route_key}. Choose a configured route")
+    print(f"{resume_key}. Resume interrupted workflow")
 
     choice = input("\nYour choice: ").strip()
-    if choice == "4":
+    if choice == resume_key:
         workflow_id = runtime.select_recovery_workflow()
         if workflow_id:
             return runtime.resume_workflow(workflow_id)
         return 0
 
     route_execution_mode = "either"
-    if choice == "5":
+    if choice == route_key and runtime.CONFIGURATION["routes"]:
         route_names = list(runtime.CONFIGURATION["routes"])
         print("\nTask types:")
         for index, name in enumerate(route_names, start=1):

@@ -418,8 +418,12 @@ os._exit(73)
             PROJECT_ROOT / "results" / f"FINAL-WORKFLOW-{workflow_id}.md"
         )
         self.created_results.append(report_file)
+        runtime_configuration = dict(orchestrator_main.CONFIGURATION)
+        runtime_configuration["agents"] = {"antigravity": {"command": "agy"}}
         try:
-            with patch.object(orchestrator_main.agent_adapters, "is_available", return_value=True), patch.object(
+            with patch.object(orchestrator_main, "CONFIGURATION", runtime_configuration), patch.object(
+                orchestrator_main.agent_adapters, "is_available", return_value=True
+            ), patch.object(
                 orchestrator_main.agent_adapters,
                 "run",
                 side_effect=fake_agent_run,

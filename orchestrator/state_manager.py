@@ -8,6 +8,7 @@ import threading
 from functools import wraps
 import os
 import time
+import re
 
 try:
     from .configuration import load_configuration
@@ -214,11 +215,9 @@ def create_workflow(original_task, agents, execution_mode="sequential"):
     if execution_mode not in {"sequential", "parallel"}:
         raise ValueError("Execution mode must be sequential or parallel.")
 
-    supported_agents = {"codex", "antigravity", "ollama"}
-
     for agent in agents:
-        if agent not in supported_agents:
-            raise ValueError(f"Unsupported agent: {agent}")
+        if not isinstance(agent, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", agent):
+            raise ValueError(f"Invalid agent ID: {agent!r}")
 
     now = get_timestamp()
     workflow_id = generate_workflow_id()

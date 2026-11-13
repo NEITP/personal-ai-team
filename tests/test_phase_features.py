@@ -13,11 +13,49 @@ from orchestrator.configuration import agents_for_route, load_configuration
 
 class TestPhaseFeatures(unittest.TestCase):
 
+    def test_default_template_has_no_preselected_agents_or_routes(self):
+        configuration = load_configuration()
+        self.assertEqual(configuration["agents"], {})
+        self.assertEqual(configuration["routes"], {})
+
+    def test_run_without_configured_agents_explains_setup(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main.main(["run", "hello"])
+        self.assertEqual(result, 2)
+        self.assertIn("Add one in config/agents.yaml", output.getvalue())
+
+    def test_generic_command_adapter_accepts_custom_agent_id(self):
+        command, stdin = agent_adapters.build_command(
+            "my_assistant",
+            "do a task",
+            {
+                "command": "my-ai-cli",
+                "adapter": "command",
+                "args": ["--prompt", "{prompt}", "--cwd", "{project_root}"],
+                "prompt_mode": "argument",
+            },
+            Path("/workspace"),
+        )
+        self.assertEqual(
+            command,
+            ["my-ai-cli", "--prompt", "do a task", "--cwd", str(Path("/workspace"))],
+        )
+        self.assertIsNone(stdin)
+
     def test_technical_research_route_includes_sequential_reviewer(self):
         configuration = load_configuration()
+        configuration["agents"] = {"finder": {}, "checker": {}}
+        configuration["max_agents"] = 2
+        configuration["routes"] = {
+            "research": {
+                "primary": "finder", "reviewer": "checker",
+                "require_review": True, "execution": "sequential",
+            }
+        }
         self.assertEqual(
-            agents_for_route(configuration, "technical_research"),
-            ["antigravity", "codex"],
+            agents_for_route(configuration, "research"),
+            ["finder", "checker"],
         )
 
     def test_agent_call_retries_only_up_to_configured_limit(self):
@@ -238,17 +276,20 @@ class TestPhaseFeatures(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["ollama", "list"])
 
     def test_cli_refuses_parallel_execution_for_review_route(self):
-        for route in ("architecture", "technical_research"):
+        configuration = dict(main.CONFIGURATION)
+        configuration["agents"] = {"builder": {}, "reviewer": {}}
+        configuration["routes"] = {
+            name: {
+                "primary": "builder", "reviewer": "reviewer",
+                "require_review": True, "execution": "sequential",
+            }
+            for name in ("architecture", "research")
+        }
+        for route in configuration["routes"]:
             with self.subTest(route=route):
                 output = StringIO()
-                with redirect_stdout(output):
-                    exit_code = main.main([
-                        "run",
-                        "review this",
-                        "--route",
-                        route,
-                        "--parallel",
-                    ])
+                with patch.object(main, "CONFIGURATION", configuration), redirect_stdout(output):
+                    exit_code = main.main(["run", "review this", "--route", route, "--parallel"])
 
                 self.assertEqual(exit_code, 2)
                 self.assertIn("configured for sequential execution", output.getvalue())
